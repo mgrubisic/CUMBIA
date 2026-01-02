@@ -1207,4 +1207,315 @@ class CircularSection(RCSection):
         }
 
 
-# Continue with more methods in next edit...
+    def analyze(self, axialLoad=0, performInteraction=False):
+        """
+        Perform complete section and member analysis.
+
+        This is the main analysis method that orchestrates all calculations including:
+        - Moment-curvature analysis
+        - Nominal moment capacity
+        - Plastic hinge length
+        - Force-displacement relationship
+        - Shear capacity
+        - Buckling assessment
+        - Deformation limit states
+        - P-M interaction diagram (if requested)
+
+        Parameters:
+            axialLoad : float, optional
+                Applied axial force (kN). Positive = compression. Default: 0
+            performInteraction : bool, optional
+                Whether to compute P-M interaction diagram. Default: False
+
+        Returns:
+            dict : Complete analysis results
+        """
+        if not hasattr(self, 'memberProps'):
+            raise ValueError("Member properties not set. Call setMemberProperties() first.")
+        if not hasattr(self, 'limitStates'):
+            self.setLimitStates()  # Use defaults
+
+        print("Setting up fiber section...")
+        self._setupConcreteLayers()
+        self._setupRebars()
+
+        print(f"Computing moment-curvature for P = {axialLoad} kN...")
+        mcResults = self._computeMomentCurvature(axialLoad)
+
+        # Store basic M-φ results
+        self.results['momentCurvature'] = mcResults
+
+        # Calculate section properties
+        print("Computing section properties...")
+        self._computeSectionProperties(mcResults, axialLoad)
+
+        # Calculate member response
+        print("Computing member force-displacement...")
+        self._computeForceDisplacement(mcResults, axialLoad)
+
+        # Buckling models
+        print("Evaluating buckling models...")
+        self._computeBucklingModels()
+
+        # Deformation limit states
+        print("Evaluating limit states...")
+        self._computeLimitStates()
+
+        # P-M interaction if requested
+        if performInteraction:
+            print("Computing P-M interaction diagram...")
+            self._computeInteractionDiagram()
+
+        print("Analysis complete!")
+        return self.results
+
+    def _computeSectionProperties(self, mcResults, axialLoad):
+        """
+        Compute section-level properties from M-φ results.
+
+        Calculates:
+        - Nominal moment and equivalent curvature
+        - First yield point
+        - Section curvature ductility
+        - Bilinear approximation
+        """
+        geom = self.geometryProps
+        mat = self.materialProps
+        lim = self.limitStates
+
+        curv = mcResults['curvature']
+        mom = mcResults['moment']
+        coverStrain = mcResults['coverStrain']
+        steelStrain = mcResults['steelStrain']
+
+        # Calculate tensile strength for cracking
+        temp = self.memberProps['temperature']
+        if temp < 0:
+            ct = (1 - 0.0105*temp) * 0.56 * np.sqrt(mat['fpc'])
+        else:
+            ct = 0.56 * np.sqrt(mat['fpc'])
+        eccr = ct / mat['ec']
+
+        # Nominal moment (serviceability criteria)
+        mn = np.interp(lim['ecser'], coverStrain, mom)
+        esaux = np.interp(lim['ecser'], coverStrain, steelStrain)
+
+        # Check if steel controls
+        if abs(esaux) > abs(lim['esser']) or np.isnan(mn):
+            mnSteel = np.interp(lim['esser'], steelStrain, mom)
+            if not np.isnan(mnSteel):
+                mn = mnSteel
+            elif np.isnan(mn) and np.isnan(mnSteel):
+                raise ValueError("Problem estimating nominal moment from serviceability strains")
+
+        # Neutral axis depth at nominal moment
+        cMn = np.interp(mn, mom, mcResults['neutralAxis'])
+
+        # First yield curvature
+        fycurvC = np.interp(1.8*mat['fpc']/mat['ec'], coverStrain, curv)
+        fycurvS = np.interp(-mat['fy']/mat['es'], steelStrain, curv)
+        fycurv = min(fycurvC, fycurvS)
+        fyM = np.interp(fycurv, curv, mom)
+
+        # Equivalent curvature
+        eqcurv = max((mn/fyM)*fycurv, fycurv)
+
+        # Bilinear approximation
+        curvBilin = np.array([0, eqcurv, curv[-1]])
+        momBilin = np.array([0, mn, mom[-1]])
+
+        # Section curvature ductility
+        sectionCurvatureDuctility = curv[-1] / eqcurv
+
+        # Store results
+        self.results['nominalMoment'] = mn
+        self.results['equivalentCurvature'] = eqcurv
+        self.results['yieldMoment'] = fyM
+        self.results['yieldCurvature'] = fycurv
+        self.results['neutralAxisAtMn'] = cMn
+        self.results['sectionCurvatureDuctility'] = sectionCurvatureDuctility
+        self.results['curvatureBilinear'] = curvBilin
+        self.results['momentBilinear'] = momBilin
+        self.results['crackingStrain'] = eccr
+
+    def _computeForceDisplacement(self, mcResults, axialLoad):
+        """
+        Compute force-displacement relationship including shear and flexural deformations.
+
+        This method calculates:
+        - Plastic hinge length
+        - Strain penetration length
+        - Flexural displacement
+        - Shear displacement
+        - Total displacement
+        - Displacement ductility
+        - Shear capacity vs displacement
+        """
+        geom = self.geometryProps
+        mat = self.materialProps
+        mem = self.memberProps
+        diameter = geom['diameter']
+        L = mem['length']
+
+        curv = mcResults['curvature']
+        mom = mcResults['moment']
+        coverStrain = mcResults['coverStrain']
+        steelStrain = mcResults['steelStrain']
+
+        # Get section properties
+        mn = self.results['nominalMoment']
+        fycurv = self.results['yieldCurvature']
+        fyM = self.results['yieldMoment']
+        eqcurv = self.results['equivalentCurvature']
+        cMn = self.results['neutralAxisAtMn']
+        eccr = self.results['crackingStrain']
+
+        # Strain penetration length
+        lsp = np.zeros(len(steelStrain))
+        for j in range(len(steelStrain)):
+            ffss = -steelStrain[j] * mat['es']
+            if ffss > mat['fy']:
+                ffss = mat['fy']
+            lsp[j] = mem['kLsp'] * ffss * geom['longBarDiam']
+
+        # Plastic hinge length
+        kkk = min(0.2*(mat['fsu']/mat['fy'] - 1), 0.08)
+        if mem['bending'] == 'single':
+            lp = max(kkk*L + mem['kLsp']*mat['fy']*geom['longBarDiam'],
+                    2*mem['kLsp']*mat['fy']*geom['longBarDiam'])
+            lbe = L
+        else:  # double
+            lp = max(kkk*L/2 + mem['kLsp']*mat['fy']*geom['longBarDiam'],
+                    2*mem['kLsp']*mat['fy']*geom['longBarDiam'])
+            lbe = L / 2
+
+        # Flexural displacement
+        displF = np.zeros(len(curv))
+        for i in range(len(curv)):
+            if coverStrain[i] < eccr:
+                # Uncracked
+                if mem['bending'] == 'single':
+                    displF[i] = curv[i] * ((L/1000)**2) / 3
+                else:
+                    displF[i] = curv[i] * ((L/1000)**2) / 6
+            elif coverStrain[i] > eccr and curv[i] < fycurv:
+                # Cracked elastic
+                if mem['bending'] == 'single':
+                    displF[i] = curv[i] * (((L + lsp[i])/1000)**2) / 3
+                else:
+                    displF[i] = curv[i] * (((L + 2*lsp[i])/1000)**2) / 6
+            else:  # curv[i] >= fycurv
+                # Post-yield
+                if mem['bending'] == 'single':
+                    displF[i] = ((curv[i] - fycurv*(mom[i]/fyM)) * (lp/1000) *
+                                ((L + lsp[i] - 0.5*lp)/1000) +
+                                (fycurv * (((L + lsp[i])/1000)**2) / 3) * (mom[i]/fyM))
+                else:
+                    displF[i] = ((curv[i] - fycurv*(mom[i]/fyM)) * (lp/1000) *
+                                ((L + 2*(lsp[i] - 0.5*lp))/1000) +
+                                (fycurv * (((L + 2*lsp[i])/1000)**2) / 6) * (mom[i]/fyM))
+
+        # Force
+        if mem['bending'] == 'single':
+            force = mom / (L/1000)
+        else:
+            force = 2 * mom / (L/1000)
+
+        # Shear displacement
+        displSh = self._computeShearDisplacement(mom, force, mn, lp, L, fycurv, displF)
+
+        # Total displacement
+        displ = displF + displSh
+
+        # Displacement ductility
+        dy1 = np.interp(fycurv, curv, displ)
+        dy = (mn/fyM) * dy1
+        du = displ[-1]
+        displBilin = np.array([0, dy, du])
+        dduct = displ / dy
+        displDuctility = np.max(dduct)
+
+        dy1f = np.interp(fycurv, curv, displF)
+        dyf = (mn/fyM) * dy1f
+
+        # Shear capacity
+        self._computeShearCapacity(force, displ, displF, dyf, cMn, axialLoad, lbe, dy)
+
+        # Store results
+        self.results['plasticHingeLength'] = lp
+        self.results['strainPenetration'] = lsp
+        self.results['displacementFlexure'] = displF
+        self.results['displacementShear'] = displSh
+        self.results['displacement'] = displ
+        self.results['force'] = force
+        self.results['yieldDisplacement'] = dy
+        self.results['ultimateDisplacement'] = du
+        self.results['displacementDuctility'] = displDuctility
+        self.results['displacementBilinear'] = displBilin
+        if mem['bending'] == 'single':
+            forceBilin = self.results['momentBilinear'] / (L/1000)
+        else:
+            forceBilin = 2 * self.results['momentBilinear'] / (L/1000)
+        self.results['forceBilinear'] = forceBilin
+
+    def _computeShearDisplacement(self, mom, force, mn, lp, L, fycurv, displF):
+        """Calculate shear displacement component."""
+        geom = self.geometryProps
+        mat = self.materialProps
+        mem = self.memberProps
+        diameter = geom['diameter']
+
+        # Shear modulus and properties
+        G = 0.43 * mat['ec']
+        As = 0.9 * self.agross
+        Ig = np.pi * (diameter**4) / 64
+        Ieff = (mn*1000 / (mat['ec']*1e6*self.results['equivalentCurvature'])) * 1e12
+
+        # Reinforcement ratios
+        longSteelRatio = self.ast / self.agross
+        transvSteelRatio = np.pi * (geom['transBarDiam']**2) / (geom['spacing']*self.dsp)
+
+        beta = min(0.5 + 20*longSteelRatio, 1)
+
+        # Alpha factor
+        if mem['bending'] == 'single':
+            alpha = min(max(1, 3 - L/diameter), 1.5)
+        else:
+            alpha = min(max(1, 3 - L/(2*diameter)), 1.5)
+
+        # Initial shear capacity
+        vc1 = 0.29 * alpha * beta * 0.8 * np.sqrt(mat['fpc']) * self.agross / 1000
+
+        # Stiffnesses
+        kscr = ((0.39*transvSteelRatio) * 0.25 * mat['es'] * ((0.8*diameter/1000)**2) /
+                (0.25 + 10*(0.39*transvSteelRatio))) * 1000
+
+        if mem['bending'] == 'single':
+            ksg = (G * As / L) / 1000
+            kscr = kscr / L
+        else:
+            ksg = (G * As / (L/2)) / 1000
+            kscr = kscr / (L/2)
+
+        kseff = ksg * (Ieff / Ig)
+        aux = (vc1 / kseff) / 1000
+
+        # Compute shear displacement
+        displSh = np.zeros(len(mom))
+        momAux = mom.copy()
+        aux2 = 0
+
+        for i in range(len(mom)):
+            if momAux[i] <= mn and force[i] < vc1:
+                displSh[i] = (force[i] / kseff) / 1000
+            elif momAux[i] <= mn and force[i] >= vc1:
+                displSh[i] = ((force[i] - vc1) / kscr) / 1000 + aux
+            else:  # momAux[i] > mn
+                momAux = 4 * momAux
+                aux2 += 1
+                displSh[i] = (displF[i] / displF[i-1]) * displSh[i-1]
+
+        return displSh
+
+
+# More methods continue in next edit (shear capacity, buckling, plotting, etc)...

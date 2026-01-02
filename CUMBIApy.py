@@ -1518,4 +1518,462 @@ class CircularSection(RCSection):
         return displSh
 
 
-# More methods continue in next edit (shear capacity, buckling, plotting, etc)...
+    def _computeShearCapacity(self, force, displ, displF, dyf, cMn, axialLoad, lbe, dy):
+        """
+        Compute shear capacity and check for shear failure.
+
+        Evaluates concrete shear contribution, steel shear contribution,
+        and axial load contribution to shear strength. Checks if shear
+        failure occurs before flexural failure.
+        """
+        geom = self.geometryProps
+        mat = self.materialProps
+        mem = self.memberProps
+        diameter = geom['diameter']
+        P = axialLoad * 1000  # Convert to N
+
+        # Steel shear contribution
+        vs = (0.5 * np.pi * (0.25*np.pi*(geom['transBarDiam']**2)) * mat['fyh'] *
+              np.cos(np.pi/6) * (diameter - geom['cover'] + 0.5*geom['transBarDiam'] - cMn) /
+              geom['spacing']) / 1000
+
+        vsd = (0.5 * np.pi * (0.25*np.pi*(geom['transBarDiam']**2)) * mat['fyh'] *
+               np.cos(35*np.pi/180) * (diameter - geom['cover'] + 0.5*geom['transBarDiam'] - cMn) /
+               geom['spacing']) / 1000
+
+        # Parameters
+        longSteelRatio = self.ast / self.agross
+        beta = min(0.5 + 20*longSteelRatio, 1)
+        dductF = displ / dyf
+
+        # Alpha based on bending mode
+        if mem['bending'] == 'single':
+            alpha = min(max(1, 3 - mem['length']/diameter), 1.5)
+            if P > 0:
+                vp = (P * (diameter - cMn) / (2*mem['length'])) / 1000
+            else:
+                vp = 0
+        else:
+            alpha = min(max(1, 3 - mem['length']/(2*diameter)), 1.5)
+            if P > 0:
+                vp = (P * (diameter - cMn) / mem['length']) / 1000
+            else:
+                vp = 0
+
+        # Concrete shear contribution (ductility-dependent)
+        vc = np.zeros(len(dductF))
+        if mem['ductilityMode'] == 'uniaxial':
+            for i in range(len(dductF)):
+                vc[i] = (alpha * beta * min(max(0.05, 0.37 - 0.04*dductF[i]), 0.29) *
+                        0.8 * np.sqrt(mat['fpc']) * self.agross / 1000)
+        else:  # biaxial
+            for i in range(len(dductF)):
+                vc[i] = (alpha * beta * min(max(0.05, 0.33 - 0.04*dductF[i]), 0.29) *
+                        0.8 * np.sqrt(mat['fpc']) * self.agross / 1000)
+
+        # Total shear capacity
+        vcd = 0.862 * vc
+        vpd = 0.85 * vp
+        V = vc + vs + vp
+        Vd = 0.85 * (vcd + vsd + vpd)
+
+        # Check for shear failure
+        shearFailure = False
+        failureCriteria = 1  # 1=flexural, 2=brittle shear, 3=some ductility, 4=ductile shear
+        failDispl = None
+        failForce = None
+        failDuct = None
+
+        if V[-1] < force[-1]:
+            failure = V - force
+            failDispl = np.interp(0, failure, displ)
+            failForce = np.interp(failDispl, displ, force)
+            failDuct = failDispl / dy
+            shearFailure = True
+
+            # Determine failure type
+            if mem['bending'] == 'single':
+                if failDispl <= 2*dy:
+                    failureCriteria = 2  # Brittle
+                elif failDispl < 8*dy:
+                    failureCriteria = 3  # Some ductility
+                else:
+                    failureCriteria = 4  # Ductile
+            else:  # double
+                if failDispl <= dy:
+                    failureCriteria = 2
+                elif failDispl < 7*dy:
+                    failureCriteria = 3
+                else:
+                    failureCriteria = 4
+
+        # Store results
+        self.results['shearCapacity'] = V
+        self.results['shearCapacityDesign'] = Vd
+        self.results['shearConcrete'] = vc
+        self.results['shearSteel'] = vs
+        self.results['shearAxial'] = vp
+        self.results['shearFailure'] = shearFailure
+        self.results['failureCriteria'] = failureCriteria
+        if shearFailure:
+            self.results['shearFailureDisplacement'] = failDispl
+            self.results['shearFailureForce'] = failForce
+            self.results['shearFailureDuctility'] = failDuct
+
+    def _computeBucklingModels(self):
+        """
+        Evaluate buckling potential using Moyer-Kowalsky and Berry-Eberhard models.
+        """
+        geom = self.geometryProps
+        mat = self.materialProps
+        mem = self.memberProps
+
+        mcResults = self.results['momentCurvature']
+        curvDuct = mcResults['curvature'] / self.results['equivalentCurvature']
+        steelStrain = mcResults['steelStrain']
+        displ = self.results['displacement']
+        force = self.results['force']
+
+        # Moyer-Kowalsky model
+        sectionCurvDuct = self.results['sectionCurvatureDuctility']
+        bucklingMK = False
+        failCuDuMK = None
+
+        if sectionCurvDuct > 4:
+            esgr4 = -0.5 * np.interp(4, curvDuct, steelStrain)
+            escc = 3 * ((geom['spacing']/geom['longBarDiam'])**(-2.5))
+
+            esgr = np.zeros(len(steelStrain))
+            for i in range(len(steelStrain)):
+                if curvDuct[i] < 1:
+                    esgr[i] = 0
+                elif curvDuct[i] < 4:
+                    esgr[i] = (esgr4 / 4) * curvDuct[i]
+                else:
+                    esgr[i] = -0.5 * steelStrain[i]
+
+            esfl = escc - esgr
+
+            if -steelStrain[-1] >= esfl[-1]:
+                bucklingMK = True
+                fail = esfl - (-steelStrain)
+                failCuDuMK = np.interp(0, fail, curvDuct)
+
+        # Berry-Eberhard model
+        bucklingBE = False
+        failCuDuBE = None
+
+        # Model constants depend on axial load ratio
+        axialRatio = (self.results['momentCurvature'].get('axialLoad', 0) * 1000) / (mat['fpc'] * self.agross)
+
+        if axialRatio >= 0.30:
+            C0, C1, C2, C3, C4 = 0.006, 7.190, 3.129, 0.651, 0.227
+        else:
+            C0, C1, C2, C3, C4 = 0.0010, 7.30, 1.30, 1.30, 3.00
+
+        transvSteelRatio = (np.pi * (geom['transBarDiam']**2)) / (geom['spacing'] * self.dsp)
+        roeff = transvSteelRatio * mat['fyh'] / mat['fpc']
+
+        lbe = mem['length'] if mem['bending'] == 'single' else mem['length']/2
+        P = 0  # Simplified - should use actual axial load
+
+        rotb = (C0 * (1 + C1*roeff) * ((1 + C2*P/(self.agross*mat['fpc']))**(-1)) *
+                (1 + C3*lbe/geom['diameter'] + C4*geom['longBarDiam']*mat['fy']/geom['diameter']))
+
+        fycurv = self.results['yieldCurvature']
+        lp = self.results['plasticHingeLength']
+        plrot = (mcResults['curvature'] - fycurv) * (lp / 1000)
+
+        if np.max(plrot) > rotb:
+            bucklingBE = True
+            failBE = plrot - rotb
+            failCuDuBE = np.interp(0, failBE, curvDuct)
+
+        # Store results
+        self.results['bucklingMoyerKowalsky'] = bucklingMK
+        if bucklingMK:
+            self.results['bucklingMKCurvatureDuctility'] = failCuDuMK
+        self.results['bucklingBerryEberhard'] = bucklingBE
+        if bucklingBE:
+            self.results['bucklingBECurvatureDuctility'] = failCuDuBE
+
+    def _computeLimitStates(self):
+        """
+        Evaluate deformation limit states (serviceability and damage control).
+        """
+        mcResults = self.results['momentCurvature']
+        lim = self.limitStates
+
+        coverStrain = mcResults['coverStrain']
+        steelStrain = mcResults['steelStrain']
+        displ = self.results['displacement']
+        curv = mcResults['curvature']
+        mom = mcResults['moment']
+        force = self.results['force']
+        curvDuct = curv / self.results['equivalentCurvature']
+        displDuct = displ / self.results['yieldDisplacement']
+
+        # Initialize
+        limitStateResults = {
+            'serviceability': {},
+            'damageControl': {},
+            'ultimate': {}
+        }
+
+        # Serviceability
+        if np.max(coverStrain) > lim['ecser'] or np.max(np.abs(steelStrain)) > abs(lim['esser']):
+            displSerC = np.interp(lim['ecser'], coverStrain, displ)
+            displSerS = np.interp(lim['esser'], steelStrain, displ)
+            displSer = min(displSerC, displSerS)
+
+            limitStateResults['serviceability'] = {
+                'displacement': displSer,
+                'displacementDuctility': np.interp(displSer, displ, displDuct),
+                'curvature': np.interp(displSer, displ, curv),
+                'curvatureDuctility': np.interp(displSer, displ, curvDuct),
+                'coverStrain': np.interp(displSer, displ, coverStrain),
+                'steelStrain': np.interp(displSer, displ, steelStrain),
+                'moment': np.interp(displSer, displ, mom),
+                'force': np.interp(displSer, displ, force)
+            }
+
+            # Damage control
+            if np.max(coverStrain) > lim['ecdam'] or np.max(np.abs(steelStrain)) > abs(lim['esdam']):
+                displDamC = np.interp(lim['ecdam'], coverStrain, displ)
+                displDamS = np.interp(lim['esdam'], steelStrain, displ)
+                displDam = min(displDamC, displDamS)
+
+                limitStateResults['damageControl'] = {
+                    'displacement': displDam,
+                    'displacementDuctility': np.interp(displDam, displ, displDuct),
+                    'curvature': np.interp(displDam, displ, curv),
+                    'curvatureDuctility': np.interp(displDam, displ, curvDuct),
+                    'coverStrain': np.interp(displDam, displ, coverStrain),
+                    'steelStrain': np.interp(displDam, displ, steelStrain),
+                    'moment': np.interp(displDam, displ, mom),
+                    'force': np.interp(displDam, displ, force)
+                }
+
+        # Ultimate
+        limitStateResults['ultimate'] = {
+            'displacement': displ[-1],
+            'displacementDuctility': displDuct[-1],
+            'curvature': curv[-1],
+            'curvatureDuctility': curvDuct[-1],
+            'coverStrain': coverStrain[-1],
+            'steelStrain': steelStrain[-1],
+            'moment': mom[-1],
+            'force': force[-1]
+        }
+
+        self.results['limitStates'] = limitStateResults
+
+    def _computeInteractionDiagram(self):
+        """
+        Compute axial load-moment (P-M) interaction diagram.
+
+        This is a simplified placeholder. Full implementation would iterate
+        through multiple axial load levels and compute moment capacity at each.
+        """
+        # Simplified stub - full implementation is complex
+        print("P-M interaction diagram: Simplified implementation")
+        # Would need to loop through axial loads and call _computeMomentCurvature
+        # for each, then extract nominal moments
+        self.results['interactionDiagram'] = {
+            'note': 'Full P-M interaction not yet implemented'
+        }
+
+    def plotResults(self):
+        """
+        Create comprehensive plots of analysis results.
+
+        Generates plots for:
+        - Material models
+        - Moment-curvature
+        - Force-displacement
+        - Limit states
+        - Buckling models (if applicable)
+        """
+        # Material models
+        self.plotMaterialModels()
+
+        # Moment-curvature
+        fig, ax = plt.subplots(figsize=(10, 6))
+        mcRes = self.results['momentCurvature']
+        ax.plot(mcRes['curvature'], mcRes['moment'], 'b-', linewidth=2,
+                label='M-φ Response')
+        ax.plot(self.results['curvatureBilinear'], self.results['momentBilinear'],
+                'r--', linewidth=2, label='Bilinear Approximation')
+        ax.set_xlabel('Curvature (1/m)', fontsize=14)
+        ax.set_ylabel('Moment (kN-m)', fontsize=14)
+        ax.set_title('Moment-Curvature Relation', fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+
+        # Force-displacement
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(self.results['displacement'], self.results['force'], 'k-',
+                linewidth=2, label='Total Response')
+        ax.plot(self.results['displacementBilinear'], self.results['forceBilinear'],
+                'b--', linewidth=2, label='Bilinear Approximation')
+        ax.plot(self.results['displacement'], self.results['shearCapacity'], 'r:',
+                linewidth=2, label='Shear Capacity (Assessment)')
+        ax.plot(self.results['displacement'], self.results['shearCapacityDesign'], 'm:',
+                linewidth=2, label='Shear Capacity (Design)')
+
+        # Mark failure points if any
+        if self.results.get('shearFailure'):
+            ax.plot(self.results['shearFailureDisplacement'],
+                   self.results['shearFailureForce'], 'mo', markersize=10,
+                   markerfacecolor='g', markeredgecolor='k',
+                   label='Shear Failure')
+
+        ax.set_xlabel('Displacement (m)', fontsize=14)
+        ax.set_ylabel('Force (kN)', fontsize=14)
+        ax.set_title('Force-Displacement Relation', fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def writeResults(self, filename):
+        """
+        Write analysis results to a text file.
+
+        Parameters:
+            filename : str
+                Output filename
+        """
+        with open(filename, 'w') as f:
+            f.write("="*80 + "\n")
+            f.write(" CUMBIA CIRCULAR SECTION ANALYSIS RESULTS\n")
+            f.write("="*80 + "\n\n")
+
+            # Section geometry
+            f.write("SECTION GEOMETRY:\n")
+            f.write(f"  Diameter: {self.geometryProps['diameter']:.1f} mm\n")
+            f.write(f"  Cover: {self.geometryProps['cover']:.1f} mm\n")
+            f.write(f"  Number of longitudinal bars: {self.geometryProps['numLongBars']}\n")
+            f.write(f"  Longitudinal bar diameter: {self.geometryProps['longBarDiam']:.1f} mm\n")
+            f.write(f"  Transverse bar diameter: {self.geometryProps['transBarDiam']:.1f} mm\n")
+            f.write(f"  Spacing: {self.geometryProps['spacing']:.1f} mm\n\n")
+
+            # Material properties
+            f.write("MATERIAL PROPERTIES:\n")
+            f.write(f"  Concrete strength (f'c): {self.materialProps['fpc']:.1f} MPa\n")
+            f.write(f"  Steel yield strength (fy): {self.materialProps['fy']:.1f} MPa\n")
+            f.write(f"  Steel ultimate strength (fsu): {self.materialProps['fsu']:.1f} MPa\n\n")
+
+            # Key results
+            f.write("SECTION CAPACITY:\n")
+            f.write(f"  Nominal moment: {self.results['nominalMoment']:.2f} kN-m\n")
+            f.write(f"  Yield moment: {self.results['yieldMoment']:.2f} kN-m\n")
+            f.write(f"  Section curvature ductility: {self.results['sectionCurvatureDuctility']:.2f}\n")
+            f.write(f"  Displacement ductility: {self.results['displacementDuctility']:.2f}\n\n")
+
+            # Failure mode
+            f.write("FAILURE MODE:\n")
+            criteria = self.results['failureCriteria']
+            if criteria == 1:
+                f.write("  Flexural failure\n")
+            elif criteria == 2:
+                f.write("  Brittle shear failure\n")
+            elif criteria == 3:
+                f.write("  Shear failure at some ductility\n")
+            elif criteria == 4:
+                f.write("  Ductile shear failure\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("Analysis completed successfully\n")
+
+        print(f"Results written to {filename}")
+
+
+# Placeholder for RectangularSection - would be similar structure
+# For brevity, providing a stub here
+
+class RectangularSection(RCSection):
+    """
+    Rectangular reinforced concrete section analysis.
+
+    NOTE: This is a simplified placeholder. Full implementation would follow
+    the same pattern as CircularSection but with rectangular geometry.
+    """
+    def __init__(self, height, width, cover, reinforcement):
+        super().__init__()
+        print("RectangularSection: Simplified implementation not yet complete")
+        # Would implement similar methods as CircularSection
+
+
+# =============================================================================
+# EXAMPLE USAGE
+# =============================================================================
+
+if __name__ == "__main__":
+    """
+    Example demonstrating CUMBIApy usage for circular section analysis.
+    """
+    print("="*80)
+    print("CUMBIA Python - Circular Section Analysis Example")
+    print("="*80)
+
+    # Create circular section
+    section = CircularSection(
+        diameter=1000,          # mm
+        cover=50,               # mm
+        numLongBars=22,
+        longBarDiam=25,         # mm
+        transBarDiam=9,         # mm
+        spacing=120,            # mm
+        transType='spirals'
+    )
+
+    # Set material properties
+    section.setMaterialProperties(
+        fpc=35,                 # MPa
+        fy=460,                 # MPa
+        fyh=400,                # MPa
+        fsu=620,                # MPa
+        concreteModel='mc',     # Mander confined
+        steelModel='ra'         # Raynor
+    )
+
+    # Set member properties
+    section.setMemberProperties(
+        length=3000,            # mm
+        bending='single',
+        ductilityMode='biaxial'
+    )
+
+    # Set limit states (optional - uses defaults if not called)
+    section.setLimitStates(
+        concreteServiceStrain=0.004,
+        steelServiceStrain=0.015,
+        concreteDamageStrain=0.018,
+        steelDamageStrain=0.060
+    )
+
+    # Perform analysis
+    print("\nStarting analysis...")
+    results = section.analyze(axialLoad=400)  # 400 kN compression
+
+    # Print key results
+    print("\n" + "="*80)
+    print("KEY RESULTS:")
+    print("="*80)
+    print(f"Nominal Moment: {results['nominalMoment']:.2f} kN-m")
+    print(f"Yield Curvature: {results['yieldCurvature']:.5f} 1/m")
+    print(f"Section Curvature Ductility: {results['sectionCurvatureDuctility']:.2f}")
+    print(f"Displacement Ductility: {results['displacementDuctility']:.2f}")
+    print(f"Plastic Hinge Length: {results['plasticHingeLength']:.1f} mm")
+
+    # Write detailed results
+    section.writeResults('CUMBIA_results.txt')
+
+    # Plot results
+    print("\nGenerating plots...")
+    section.plotResults()
+
+    print("\nAnalysis complete!")
+

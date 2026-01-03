@@ -2145,6 +2145,7 @@ class RectangularSection(RCSection):
         # Calculate derived geometry
         self.hcore = height - 2*cover + transBarDiam
         self.bcore = width - 2*cover + transBarDiam
+        self.dsp = self.hcore  # Alias for shared methods (use height core as characteristic)
         self.dcore = cover - transBarDiam*0.5
 
         # Calculate total steel area

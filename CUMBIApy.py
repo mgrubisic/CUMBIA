@@ -1356,7 +1356,9 @@ class CircularSection(RCSection):
         geom = self.geometryProps
         mat = self.materialProps
         mem = self.memberProps
-        diameter = geom['diameter']
+
+        # Get section dimension (diameter for circular, height for rectangular)
+        diameter = geom.get('diameter', geom.get('height', 0))
         L = mem['length']
 
         curv = mcResults['curvature']
@@ -2125,15 +2127,19 @@ class RectangularSection(RCSection):
         super().__init__()
 
         # Store geometry
+        layers_array = np.array(reinforcementLayers)
         self.geometryProps = {
             'height': height,
             'width': width,
+            'diameter': height,  # Alias for shared methods (use height as characteristic dimension)
             'cover': cover,
-            'reinforcementLayers': np.array(reinforcementLayers),
+            'reinforcementLayers': layers_array,
             'transBarDiam': transBarDiam,
             'spacing': spacing,
             'numLegsX': numLegsX,
-            'numLegsY': numLegsY
+            'numLegsY': numLegsY,
+            'longBarDiam': layers_array[0, 2],  # Use first layer bar diameter as representative
+            'numLongBars': int(np.sum(layers_array[:, 1]))  # Total number of bars
         }
 
         # Calculate derived geometry

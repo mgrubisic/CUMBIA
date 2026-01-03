@@ -1772,16 +1772,136 @@ class CircularSection(RCSection):
         """
         Compute axial load-moment (P-M) interaction diagram.
 
-        This is a simplified placeholder. Full implementation would iterate
-        through multiple axial load levels and compute moment capacity at each.
+        Computes the interaction surface by analyzing the section at multiple
+        axial load levels from pure tension to pure compression.
+
+        Results stored in self.results['interactionDiagram'] containing:
+            - axialLoads: Array of P values (kN)
+            - moments: Array of M values at each P (kN-m)
+            - axialLoadsApprox: Simplified bilinear approximation points
+            - momentsApprox: Simplified moments for bilinear approximation
         """
-        # Simplified stub - full implementation is complex
-        print("P-M interaction diagram: Simplified implementation")
-        # Would need to loop through axial loads and call _computeMomentCurvature
-        # for each, then extract nominal moments
+        geom = self.geometryProps
+        mat = self.materialProps
+        lim = self.limitStates
+
+        # Calculate yield surface forces
+        if hasattr(self, 'dsp'):  # Circular
+            acore = 0.25 * np.pi * (self.dsp**2)
+            diameter = geom['diameter']
+        else:  # Rectangular
+            acore = self.hcore * self.bcore
+            diameter = geom['height']  # Use height as characteristic dimension
+
+        # Pure compression and tension forces for yield surface
+        pCid = (self._interpolateStress(lim['csid'], self.strainConf, self.stressConf) *
+                (acore - self.ast) +
+                self._interpolateStress(lim['csid'], self.strainUnconf, self.stressUnconf) *
+                (self.agross - acore) +
+                self.ast * self._interpolateStress(lim['csid'], self.strainSteel, self.stressSteel))
+
+        pTid = self.ast * self._interpolateStress(lim['ssid'], self.strainSteel, self.stressSteel)
+
+        # Create axial load vector
+        # From 90% tension to 70% compression
+        axialLoads = np.concatenate([
+            np.arange(-0.90*pTid, 0, 0.30*pTid),
+            np.arange(0.05*mat['fpc']*self.agross, 0.7*pCid, 0.05*mat['fpc']*self.agross)
+        ])
+
+        nPoints = len(axialLoads)
+        moments = np.zeros(nPoints)
+        concreteStrains = np.zeros(nPoints)
+        steelStrains = np.zeros(nPoints)
+
+        print(f"  Computing {nPoints} points on P-M interaction curve...")
+
+        # Compute moment capacity at each axial load
+        for i in range(nPoints):
+            P = axialLoads[i]
+
+            # Perform moment-curvature analysis at this axial load
+            try:
+                # Temporarily modify setup to compute for this P
+                mcResults = self._computeMomentCurvature(P / 1000)  # Convert to kN
+
+                # Extract nominal moment at limit state strains
+                coverStrain = mcResults['coverStrain']
+                steelStrain = mcResults['steelStrain']
+                mom = mcResults['moment']
+
+                # Nominal moment based on serviceability criteria
+                mn = np.interp(lim['csid'], coverStrain, mom, left=np.nan, right=np.nan)
+                esaux = np.interp(lim['csid'], coverStrain, steelStrain, left=np.nan, right=np.nan)
+
+                # Check if steel controls
+                if abs(esaux) > abs(lim['ssid']) or np.isnan(mn):
+                    mnSteel = np.interp(-lim['ssid'], steelStrain, mom, left=np.nan, right=np.nan)
+                    if not np.isnan(mnSteel):
+                        mn = mnSteel
+                        concreteStrains[i] = np.interp(-lim['ssid'], steelStrain, coverStrain)
+                        steelStrains[i] = -lim['ssid']
+                    else:
+                        # Use maximum moment if nominal cannot be determined
+                        mn = np.max(mom)
+                        maxIdx = np.argmax(mom)
+                        concreteStrains[i] = coverStrain[maxIdx]
+                        steelStrains[i] = steelStrain[maxIdx]
+                else:
+                    concreteStrains[i] = lim['csid']
+                    steelStrains[i] = esaux
+
+                moments[i] = mn
+
+            except Exception as e:
+                print(f"  Warning: Failed to compute point {i+1}/{nPoints} at P={P/1000:.1f} kN")
+                moments[i] = 0
+
+            # Progress indicator
+            if (i + 1) % max(1, nPoints // 10) == 0:
+                print(f"  Progress: {i+1}/{nPoints} points complete")
+
+        # Add end points (pure compression and pure tension)
+        axialLoadsComplete = np.concatenate([[-pTid], axialLoads, [pCid]])
+        momentsComplete = np.concatenate([[0], moments, [0]])
+
+        # Create simplified bilinear approximation for NLTHA
+        # Find balanced point (maximum moment)
+        maxMomentIdx = np.argmax(momentsComplete)
+        pB = axialLoadsComplete[maxMomentIdx]
+        mB = momentsComplete[maxMomentIdx]
+
+        # Points at 1/3 and 2/3 of balanced load
+        pB13 = pB / 3
+        mB13 = np.interp(pB13, axialLoadsComplete, momentsComplete)
+
+        pB23 = 2 * pB / 3
+        mB23 = np.interp(pB23, axialLoadsComplete, momentsComplete)
+
+        # Moment at zero axial load
+        mB0 = np.interp(0, axialLoadsComplete, momentsComplete)
+
+        # Simplified points for NLTHA
+        axialLoadsApprox = np.array([-pTid, 0, pB13, pB23, pB, pCid])
+        momentsApprox = np.array([0, mB0, mB13, mB23, mB, 0])
+
+        # Store results
         self.results['interactionDiagram'] = {
-            'note': 'Full P-M interaction not yet implemented'
+            'axialLoads': axialLoadsComplete / 1000,  # Convert to kN
+            'moments': momentsComplete,
+            'concreteStrains': concreteStrains,
+            'steelStrains': steelStrains,
+            'axialLoadsApprox': axialLoadsApprox / 1000,  # kN
+            'momentsApprox': momentsApprox,
+            'balancedPoint': {'P': pB / 1000, 'M': mB},
+            'pureTension': -pTid / 1000,
+            'pureCompression': pCid / 1000
         }
+
+        print(f"  P-M interaction complete!")
+        print(f"    Pure tension: {-pTid/1000:.1f} kN")
+        print(f"    Pure compression: {pCid/1000:.1f} kN")
+        print(f"    Balanced point: P={pB/1000:.1f} kN, M={mB:.1f} kN-m")
 
     def plotResults(self):
         """
@@ -1833,6 +1953,58 @@ class CircularSection(RCSection):
         ax.set_title('Force-Displacement Relation', fontsize=14)
         ax.legend(fontsize=12)
         ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def plotInteractionDiagram(self):
+        """
+        Plot P-M interaction diagram if it has been computed.
+
+        Creates a plot showing:
+        - Full interaction curve
+        - Simplified bilinear approximation
+        - Balanced point
+        - Pure compression and tension limits
+        """
+        if 'interactionDiagram' not in self.results:
+            print("P-M interaction diagram not computed. Run analyze(performInteraction=True) first.")
+            return
+
+        interaction = self.results['interactionDiagram']
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Plot full interaction curve
+        ax.plot(interaction['moments'], interaction['axialLoads'], 'b-',
+                linewidth=2.5, label='P-M Interaction Curve')
+
+        # Plot simplified approximation
+        ax.plot(interaction['momentsApprox'], interaction['axialLoadsApprox'], 'r--',
+                linewidth=2, marker='o', markersize=8,
+                label='Simplified Approximation')
+
+        # Mark balanced point
+        bp = interaction['balancedPoint']
+        ax.plot(bp['M'], bp['P'], 'go', markersize=12,
+                markerfacecolor='lime', markeredgecolor='darkgreen',
+                markeredgewidth=2, label=f"Balanced Point\n(P={bp['P']:.1f} kN, M={bp['M']:.1f} kN-m)")
+
+        # Mark pure compression and tension
+        ax.axhline(y=interaction['pureCompression'], color='gray',
+                  linestyle=':', linewidth=1.5, label=f"Pure Compression ({interaction['pureCompression']:.1f} kN)")
+        ax.axhline(y=interaction['pureTension'], color='gray',
+                  linestyle=':', linewidth=1.5, label=f"Pure Tension ({interaction['pureTension']:.1f} kN)")
+
+        # Mark zero axial load
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.3)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8, alpha=0.3)
+
+        ax.set_xlabel('Moment (kN-m)', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Axial Load (kN)', fontsize=14, fontweight='bold')
+        ax.set_title('P-M Interaction Diagram', fontsize=16, fontweight='bold')
+        ax.legend(fontsize=10, loc='best')
+        ax.grid(True, alpha=0.3, linestyle='--')
 
         plt.tight_layout()
         plt.show()
@@ -2394,20 +2566,36 @@ class RectangularSection(RCSection):
     _computeLimitStates = CircularSection._computeLimitStates
     _computeInteractionDiagram = CircularSection._computeInteractionDiagram
     plotResults = CircularSection.plotResults
+    plotInteractionDiagram = CircularSection.plotInteractionDiagram
     writeResults = CircularSection.writeResults
 
 
 # =============================================================================
-# EXAMPLE USAGE
+# TEST EXAMPLES
 # =============================================================================
 
-if __name__ == "__main__":
+def test_circular_section():
     """
-    Example demonstrating CUMBIApy usage for circular section analysis.
+    Complete test example for circular RC section analysis.
+
+    This example demonstrates:
+    - Circular section setup
+    - Material model generation
+    - Moment-curvature analysis
+    - Force-displacement analysis
+    - P-M interaction diagram
+    - Result plotting and export
     """
     print("="*80)
-    print("CUMBIA Python - Circular Section Analysis Example")
+    print(" TEST 1: CIRCULAR SECTION ANALYSIS")
     print("="*80)
+    print()
+    print("Section: D=1000mm circular column")
+    print("Reinforcement: 22-Φ25mm bars, spirals Φ9mm @ 120mm")
+    print("Materials: f'c=35 MPa, fy=460 MPa")
+    print("Member: L=3000mm, single curvature, P=400 kN compression")
+    print("="*80)
+    print()
 
     # Create circular section
     section = CircularSection(
@@ -2437,7 +2625,7 @@ if __name__ == "__main__":
         ductilityMode='biaxial'
     )
 
-    # Set limit states (optional - uses defaults if not called)
+    # Set limit states
     section.setLimitStates(
         concreteServiceStrain=0.004,
         steelServiceStrain=0.015,
@@ -2445,26 +2633,257 @@ if __name__ == "__main__":
         steelDamageStrain=0.060
     )
 
-    # Perform analysis
-    print("\nStarting analysis...")
-    results = section.analyze(axialLoad=400)  # 400 kN compression
+    # Perform analysis with P-M interaction
+    print("Starting analysis...")
+    results = section.analyze(axialLoad=400, performInteraction=True)
 
     # Print key results
     print("\n" + "="*80)
-    print("KEY RESULTS:")
+    print("KEY RESULTS - CIRCULAR SECTION:")
     print("="*80)
-    print(f"Nominal Moment: {results['nominalMoment']:.2f} kN-m")
-    print(f"Yield Curvature: {results['yieldCurvature']:.5f} 1/m")
+    print(f"Nominal Moment:              {results['nominalMoment']:.2f} kN-m")
+    print(f"Yield Moment:                {results['yieldMoment']:.2f} kN-m")
+    print(f"Ultimate Moment:             {results['momentCurvature']['moment'][-1]:.2f} kN-m")
+    print(f"Yield Curvature:             {results['yieldCurvature']:.5f} 1/m")
+    print(f"Ultimate Curvature:          {results['momentCurvature']['curvature'][-1]:.5f} 1/m")
     print(f"Section Curvature Ductility: {results['sectionCurvatureDuctility']:.2f}")
-    print(f"Displacement Ductility: {results['displacementDuctility']:.2f}")
-    print(f"Plastic Hinge Length: {results['plasticHingeLength']:.1f} mm")
+    print(f"Yield Displacement:          {results['yieldDisplacement']*1000:.2f} mm")
+    print(f"Ultimate Displacement:       {results['ultimateDisplacement']*1000:.2f} mm")
+    print(f"Displacement Ductility:      {results['displacementDuctility']:.2f}")
+    print(f"Plastic Hinge Length:        {results['plasticHingeLength']:.1f} mm")
+    print()
+    print("Shear Capacity:")
+    print(f"  Concrete contribution:     {results['shearConcrete'][-1]:.2f} kN")
+    print(f"  Steel contribution:        {results['shearSteel']:.2f} kN")
+    print(f"  Total capacity:            {results['shearCapacity'][-1]:.2f} kN")
+    print(f"  Shear failure:             {'YES' if results['shearFailure'] else 'NO'}")
+    print()
+    print("Buckling:")
+    print(f"  Moyer-Kowalsky buckling:   {'YES' if results['bucklingMoyerKowalsky'] else 'NO'}")
+    print(f"  Berry-Eberhard buckling:   {'YES' if results['bucklingBerryEberhard'] else 'NO'}")
+    print()
+
+    if 'interactionDiagram' in results:
+        interaction = results['interactionDiagram']
+        print("P-M Interaction:")
+        print(f"  Pure tension capacity:     {interaction['pureTension']:.1f} kN")
+        print(f"  Pure compression capacity: {interaction['pureCompression']:.1f} kN")
+        print(f"  Balanced point:            P={interaction['balancedPoint']['P']:.1f} kN, M={interaction['balancedPoint']['M']:.1f} kN-m")
+
+    print("="*80)
 
     # Write detailed results
-    section.writeResults('CUMBIA_results.txt')
+    section.writeResults('CUMBIA_circular_results.txt')
+    print("\nDetailed results written to 'CUMBIA_circular_results.txt'")
 
     # Plot results
     print("\nGenerating plots...")
+    section.plotMaterialModels()
     section.plotResults()
 
-    print("\nAnalysis complete!")
+    if 'interactionDiagram' in results:
+        section.plotInteractionDiagram()
+
+    print("\n" + "="*80)
+    print("CIRCULAR SECTION TEST COMPLETE!")
+    print("="*80)
+    print()
+
+    return section
+
+
+def test_rectangular_section():
+    """
+    Complete test example for rectangular RC section analysis.
+
+    This example demonstrates:
+    - Rectangular section with multiple reinforcement layers
+    - Material model generation for rectangular geometry
+    - Complete M-φ and F-Δ analysis
+    - P-M interaction diagram
+    - Comparison with circular section behavior
+    """
+    print("="*80)
+    print(" TEST 2: RECTANGULAR SECTION ANALYSIS")
+    print("="*80)
+    print()
+    print("Section: 400x400mm square column")
+    print("Reinforcement: 3-Φ25mm top + 3-Φ25mm bottom, hoops Φ10mm @ 150mm")
+    print("Materials: f'c=28 MPa, fy=450 MPa")
+    print("Member: L=1200mm, single curvature, P=200 kN compression")
+    print("="*80)
+    print()
+
+    # Create rectangular section - square 400x400mm
+    section = RectangularSection(
+        height=400,             # mm
+        width=400,              # mm
+        cover=40,               # mm
+        reinforcementLayers=[
+            [52.7, 3, 25],      # [distance from top (mm), num bars, diameter (mm)]
+            [347.3, 3, 25]      # Bottom layer
+        ],
+        transBarDiam=10,        # mm
+        spacing=150,            # mm
+        numLegsX=2,             # Confinement legs in X
+        numLegsY=2              # Shear legs in Y
+    )
+
+    # Set material properties
+    section.setMaterialProperties(
+        fpc=28,                 # MPa
+        fy=450,                 # MPa
+        fyh=400,                # MPa
+        fsu=600,                # MPa
+        concreteModel='mc',     # Mander confined
+        steelModel='ra'         # Raynor
+    )
+
+    # Set member properties
+    section.setMemberProperties(
+        length=1200,            # mm
+        bending='single',
+        ductilityMode='uniaxial'  # Rectangular typically uniaxial
+    )
+
+    # Set limit states
+    section.setLimitStates(
+        concreteServiceStrain=0.004,
+        steelServiceStrain=0.015,
+        concreteDamageStrain=0.018,
+        steelDamageStrain=0.060
+    )
+
+    # Perform analysis with P-M interaction
+    print("Starting analysis...")
+    results = section.analyze(axialLoad=200, performInteraction=True)
+
+    # Print key results
+    print("\n" + "="*80)
+    print("KEY RESULTS - RECTANGULAR SECTION:")
+    print("="*80)
+    print(f"Nominal Moment:              {results['nominalMoment']:.2f} kN-m")
+    print(f"Yield Moment:                {results['yieldMoment']:.2f} kN-m")
+    print(f"Ultimate Moment:             {results['momentCurvature']['moment'][-1]:.2f} kN-m")
+    print(f"Yield Curvature:             {results['yieldCurvature']:.5f} 1/m")
+    print(f"Ultimate Curvature:          {results['momentCurvature']['curvature'][-1]:.5f} 1/m")
+    print(f"Section Curvature Ductility: {results['sectionCurvatureDuctility']:.2f}")
+    print(f"Yield Displacement:          {results['yieldDisplacement']*1000:.2f} mm")
+    print(f"Ultimate Displacement:       {results['ultimateDisplacement']*1000:.2f} mm")
+    print(f"Displacement Ductility:      {results['displacementDuctility']:.2f}")
+    print(f"Plastic Hinge Length:        {results['plasticHingeLength']:.1f} mm")
+    print()
+    print("Shear Capacity:")
+    print(f"  Concrete contribution:     {results['shearConcrete'][-1]:.2f} kN")
+    print(f"  Steel contribution:        {results['shearSteel']:.2f} kN")
+    print(f"  Total capacity:            {results['shearCapacity'][-1]:.2f} kN")
+    print(f"  Shear failure:             {'YES' if results['shearFailure'] else 'NO'}")
+    print()
+    print("Buckling:")
+    print(f"  Moyer-Kowalsky buckling:   {'YES' if results['bucklingMoyerKowalsky'] else 'NO'}")
+    print(f"  Berry-Eberhard buckling:   {'YES' if results['bucklingBerryEberhard'] else 'NO'}")
+    print()
+
+    if 'interactionDiagram' in results:
+        interaction = results['interactionDiagram']
+        print("P-M Interaction:")
+        print(f"  Pure tension capacity:     {interaction['pureTension']:.1f} kN")
+        print(f"  Pure compression capacity: {interaction['pureCompression']:.1f} kN")
+        print(f"  Balanced point:            P={interaction['balancedPoint']['P']:.1f} kN, M={interaction['balancedPoint']['M']:.1f} kN-m")
+
+    print("="*80)
+
+    # Write detailed results
+    section.writeResults('CUMBIA_rectangular_results.txt')
+    print("\nDetailed results written to 'CUMBIA_rectangular_results.txt'")
+
+    # Plot results
+    print("\nGenerating plots...")
+    section.plotMaterialModels()
+    section.plotResults()
+
+    if 'interactionDiagram' in results:
+        section.plotInteractionDiagram()
+
+    print("\n" + "="*80)
+    print("RECTANGULAR SECTION TEST COMPLETE!")
+    print("="*80)
+    print()
+
+    return section
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    """
+    Run complete test suite for CUMBIApy.
+
+    Tests both circular and rectangular sections with full analysis including
+    P-M interaction diagrams.
+    """
+    print("\n")
+    print("#"*80)
+    print("##" + " "*76 + "##")
+    print("##" + " "*20 + "CUMBIApy - COMPLETE TEST SUITE" + " "*26 + "##")
+    print("##" + " "*76 + "##")
+    print("##" + " "*10 + "Python Implementation of CUMBIA for RC Section Analysis" + " "*14 + "##")
+    print("##" + " "*76 + "##")
+    print("#"*80)
+    print()
+
+    import sys
+
+    # Option to run individual tests
+    if len(sys.argv) > 1:
+        test_type = sys.argv[1].lower()
+        if test_type == 'circular':
+            test_circular_section()
+        elif test_type == 'rectangular':
+            test_rectangular_section()
+        else:
+            print(f"Unknown test type: {test_type}")
+            print("Usage: python CUMBIApy.py [circular|rectangular]")
+            print("       (run without arguments to execute all tests)")
+    else:
+        # Run all tests
+        try:
+            # Test 1: Circular section
+            circular = test_circular_section()
+
+            input("\nPress Enter to continue to rectangular section test...")
+            print("\n\n")
+
+            # Test 2: Rectangular section
+            rectangular = test_rectangular_section()
+
+            # Summary
+            print("\n")
+            print("#"*80)
+            print("##" + " "*76 + "##")
+            print("##" + " "*26 + "TEST SUMMARY" + " "*38 + "##")
+            print("##" + " "*76 + "##")
+            print("#"*80)
+            print()
+            print("Both circular and rectangular section analyses completed successfully!")
+            print()
+            print("Output files generated:")
+            print("  - CUMBIA_circular_results.txt")
+            print("  - CUMBIA_rectangular_results.txt")
+            print()
+            print("All plots displayed.")
+            print()
+            print("#"*80)
+            print()
+            print("CUMBIApy test suite complete! ✓")
+            print()
+
+        except KeyboardInterrupt:
+            print("\n\nTest interrupted by user.")
+        except Exception as e:
+            print(f"\n\nERROR during testing: {e}")
+            import traceback
+            traceback.print_exc()
 

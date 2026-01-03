@@ -1192,7 +1192,9 @@ class CircularSection(RCSection):
                 break
 
         # Trim arrays to actual length
-        lastIdx = k + 2 if message != 0 else np_points + 1
+        # If terminated early (message != 0), use k+1 (last filled index)
+        # Otherwise use np_points+1 (all points filled)
+        lastIdx = k + 1 if message != 0 else np_points + 1
 
         return {
             'curvature': curvature[:lastIdx],
@@ -2508,7 +2510,8 @@ class RectangularSection(RCSection):
             if message != 0:
                 break
 
-        lastIdx = k + 2 if message != 0 else np_points + 1
+        # Trim arrays to actual length
+        lastIdx = k + 1 if message != 0 else np_points + 1
 
         return {
             'curvature': curvature[:lastIdx],

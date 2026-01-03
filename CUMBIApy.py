@@ -1890,20 +1890,511 @@ class CircularSection(RCSection):
         print(f"Results written to {filename}")
 
 
-# Placeholder for RectangularSection - would be similar structure
-# For brevity, providing a stub here
+# =============================================================================
+# RECTANGULAR SECTION CLASS
+# =============================================================================
 
 class RectangularSection(RCSection):
     """
     Rectangular reinforced concrete section analysis.
 
-    NOTE: This is a simplified placeholder. Full implementation would follow
-    the same pattern as CircularSection but with rectangular geometry.
+    This class performs comprehensive analysis of rectangular RC members including:
+        - Moment-curvature analysis
+        - Force-displacement analysis
+        - P-M interaction diagrams
+        - Buckling assessment
+        - Shear capacity evaluation
+        - Deformation limit states
+
+    Example:
+        >>> section = RectangularSection(
+        ...     height=400,
+        ...     width=300,
+        ...     cover=40,
+        ...     reinforcementLayers=[
+        ...         [52.7, 3, 25.4],  # [distance from top, num bars, diameter]
+        ...         [347.3, 3, 25.4]
+        ...     ],
+        ...     transBarDiam=9.5,
+        ...     spacing=120,
+        ...     numLegsX=2,
+        ...     numLegsY=2
+        ... )
+        >>> section.setMaterialProperties(fpc=28, fy=450, fyh=400)
+        >>> section.setMemberProperties(length=1200, bending='single')
+        >>> section.analyze(axialLoad=-200)
     """
-    def __init__(self, height, width, cover, reinforcement):
+
+    def __init__(self, height, width, cover, reinforcementLayers,
+                 transBarDiam, spacing, numLegsX=2, numLegsY=2):
+        """
+        Initialize rectangular section geometry.
+
+        Parameters:
+            height : float
+                Section height (mm)
+            width : float
+                Section width (mm)
+            cover : float
+                Cover to longitudinal bars (mm)
+            reinforcementLayers : list of lists
+                Each row: [distance from top (mm), number of bars, bar diameter (mm)]
+            transBarDiam : float
+                Transverse reinforcement diameter (mm)
+            spacing : float
+                Spacing of transverse steel (mm)
+            numLegsX : int, optional
+                Number of legs of transverse steel in X direction (confinement)
+            numLegsY : int, optional
+                Number of legs of transverse steel in Y direction (shear)
+        """
         super().__init__()
-        print("RectangularSection: Simplified implementation not yet complete")
-        # Would implement similar methods as CircularSection
+
+        # Store geometry
+        self.geometryProps = {
+            'height': height,
+            'width': width,
+            'cover': cover,
+            'reinforcementLayers': np.array(reinforcementLayers),
+            'transBarDiam': transBarDiam,
+            'spacing': spacing,
+            'numLegsX': numLegsX,
+            'numLegsY': numLegsY
+        }
+
+        # Calculate derived geometry
+        self.hcore = height - 2*cover + transBarDiam
+        self.bcore = width - 2*cover + transBarDiam
+        self.dcore = cover - transBarDiam*0.5
+
+        # Calculate total steel area
+        self.ast = 0
+        for layer in reinforcementLayers:
+            self.ast += layer[1] * 0.25 * np.pi * (layer[2]**2)
+
+        self.agross = height * width
+
+    def setMaterialProperties(self, fpc, fy, fyh, es=200000, fsu=None,
+                             esh=0.008, esu=0.12, eco=0.002, esm=0.11,
+                             espall=0.0064, ec=None, c1=3.5, eyPlateau=350,
+                             concreteModel='mc', steelModel='ra',
+                             lightweightConcrete=False):
+        """Set material properties (same interface as CircularSection)."""
+        if fsu is None:
+            fsu = 1.35 * fy
+        if ec is None:
+            ec = 5000 * np.sqrt(fpc)
+
+        self.materialProps = {
+            'fpc': fpc, 'fy': fy, 'fyh': fyh, 'es': es, 'fsu': fsu,
+            'esh': esh, 'esu': esu, 'eco': eco, 'esm': esm, 'espall': espall,
+            'ec': ec, 'c1': c1, 'eyPlateau': eyPlateau,
+            'concreteModel': concreteModel, 'steelModel': steelModel,
+            'lightweightConcrete': lightweightConcrete
+        }
+
+        self._generateMaterialModels()
+
+    def _generateMaterialModels(self):
+        """Generate stress-strain curves for rectangular section."""
+        geom = self.geometryProps
+        mat = self.materialProps
+
+        # Calculate clear distances between bars for confinement
+        wi = self._calculateClearDistances()
+
+        # Confined concrete
+        if mat['concreteModel'].lower() == 'mc':
+            if mat['lightweightConcrete']:
+                self.strainConf, self.stressConf = MaterialModels.manderConfinedLightweight(
+                    mat['ec'], self.ast, geom['transBarDiam'], geom['cover'],
+                    geom['spacing'], mat['fpc'], mat['fyh'], mat['eco'], mat['esm'],
+                    mat['espall'], 'rectangular', height=geom['height'], width=geom['width'],
+                    ncx=geom['numLegsX'], ncy=geom['numLegsY'], wi=wi,
+                    dels=self.analysisParams['deltaStrain'], transType='hoops'
+                )
+            else:
+                self.strainConf, self.stressConf = MaterialModels.manderConfined(
+                    mat['ec'], self.ast, geom['transBarDiam'], geom['cover'],
+                    geom['spacing'], mat['fpc'], mat['fyh'], mat['eco'], mat['esm'],
+                    mat['espall'], 'rectangular', height=geom['height'], width=geom['width'],
+                    ncx=geom['numLegsX'], ncy=geom['numLegsY'], wi=wi,
+                    dels=self.analysisParams['deltaStrain'], transType='hoops'
+                )
+        else:
+            raise NotImplementedError("Custom material models not yet implemented")
+
+        # Unconfined concrete
+        if mat['lightweightConcrete']:
+            raise NotImplementedError("Lightweight unconfined for rectangular not implemented")
+        else:
+            self.strainUnconf, self.stressUnconf = MaterialModels.manderUnconfined(
+                mat['ec'], self.ast, geom['transBarDiam'], geom['cover'],
+                geom['spacing'], mat['fpc'], mat['fyh'], mat['eco'], mat['esm'],
+                mat['espall'], 'rectangular', height=geom['height'], width=geom['width'],
+                ncx=geom['numLegsX'], ncy=geom['numLegsY'], wi=wi,
+                dels=self.analysisParams['deltaStrain']
+            )
+
+        # Steel model
+        if mat['steelModel'].lower() == 'ra':
+            self.strainSteel, self.stressSteel = MaterialModels.steelRaynor(
+                mat['es'], mat['fy'], mat['fsu'], mat['esh'], mat['esu'],
+                dels=self.analysisParams['deltaStrain'], c1=mat['c1'],
+                ey_plateau=mat['eyPlateau']
+            )
+        elif mat['steelModel'].lower() == 'ks':
+            self.strainSteel, self.stressSteel = MaterialModels.steelKing(
+                mat['es'], mat['fy'], mat['fsu'], mat['esh'], mat['esu'],
+                dels=self.analysisParams['deltaStrain']
+            )
+        else:
+            raise ValueError("Steel model must be 'ra' or 'ks'")
+
+        # Extend curves
+        self.ecu = self.strainConf[-1]
+        self.ecuMander = self.ecu / 1.5
+        dels = self.analysisParams['deltaStrain']
+
+        self.strainConf = np.concatenate([[-1e10], self.strainConf,
+                                          [self.strainConf[-1] + dels, 1e10]])
+        self.stressConf = np.concatenate([[0], self.stressConf, [0, 0]])
+
+        self.strainUnconf = np.concatenate([[-1e10], self.strainUnconf,
+                                            [self.strainUnconf[-1] + dels, 1e10]])
+        self.stressUnconf = np.concatenate([[0], self.stressUnconf, [0, 0]])
+
+        self.esu = self.strainSteel[-1]
+        self.strainSteel = np.concatenate([self.strainSteel,
+                                           [self.strainSteel[-1] + dels, 1e10]])
+        self.stressSteel = np.concatenate([self.stressSteel, [0, 0]])
+
+        strainSteelNeg = -self.strainSteel[::-1]
+        stressSteelNeg = -self.stressSteel[::-1]
+        self.strainSteel = np.concatenate([strainSteelNeg, self.strainSteel[1:]])
+        self.stressSteel = np.concatenate([stressSteelNeg, self.stressSteel[1:]])
+
+    def _calculateClearDistances(self):
+        """Calculate clear distances between peripheral bars."""
+        geom = self.geometryProps
+        layers = geom['reinforcementLayers']
+
+        if len(layers) == 1:
+            # Single layer
+            return np.array([(geom['height'] - 2*geom['cover'] - 2*layers[0,2])*2,
+                           (geom['width'] - 2*geom['cover'] - 2*layers[0,2])*2])
+
+        # Multiple layers - calculate spacing
+        wi = []
+        # Top layer
+        if layers[0,1] > 1:
+            spacing_top = (geom['width'] - 2*geom['cover'] - layers[0,1]*layers[0,2]) / (layers[0,1] - 1)
+            wi.extend([spacing_top] * int(layers[0,1] - 1))
+
+        # Bottom layer
+        if layers[-1,1] > 1:
+            spacing_bot = (geom['width'] - 2*geom['cover'] - layers[-1,1]*layers[-1,2]) / (layers[-1,1] - 1)
+            wi.extend([spacing_bot] * int(layers[-1,1] - 1))
+
+        # Vertical spacing between layers
+        for i in range(len(layers)-1):
+            vert_spacing = layers[i+1,0] - layers[i,0] - 0.5*(layers[i,2] + layers[i+1,2])
+            wi.extend([vert_spacing] * 2)
+
+        return np.array(wi)
+
+    def setMemberProperties(self, length, bending='single', ductilityMode='uniaxial',
+                           temperature=40, kLsp=0.022):
+        """Set member-level properties."""
+        self.memberProps = {
+            'length': length,
+            'bending': bending.lower(),
+            'ductilityMode': ductilityMode.lower(),
+            'temperature': temperature,
+            'kLsp': kLsp
+        }
+
+    def setLimitStates(self, concreteServiceStrain=0.004, steelServiceStrain=0.015,
+                      concreteDamageStrain=0.018, steelDamageStrain=0.060,
+                      concreteInteractionStrain=0.004, steelInteractionStrain=0.015):
+        """Set deformation limit state criteria."""
+        if isinstance(concreteDamageStrain, str) and concreteDamageStrain.lower() == 'twth':
+            concreteDamageStrain = self.ecuMander
+
+        self.limitStates = {
+            'ecser': concreteServiceStrain,
+            'esser': -steelServiceStrain,
+            'ecdam': concreteDamageStrain,
+            'esdam': -steelDamageStrain,
+            'csid': concreteInteractionStrain,
+            'ssid': steelInteractionStrain
+        }
+
+    def _setupConcreteLayers(self):
+        """Setup concrete layers for rectangular section."""
+        geom = self.geometryProps
+        height = geom['height']
+        width = geom['width']
+        ncl = self.analysisParams['numConcreteLayers']
+
+        # Layer boundaries
+        tcl = height / ncl
+        yl = np.arange(tcl, height + tcl, tcl)
+        yl = np.sort(np.concatenate([yl, [self.dcore, height - self.dcore]]))
+        yl = np.unique(yl)
+
+        # Total layer areas
+        atc = np.diff(np.concatenate([[0], yl])) * width
+
+        # Confined layer areas
+        yc = yl - self.dcore
+        yc = yc[(yc > 0) & (yc < self.hcore)]
+        yc = np.append(yc, self.hcore)
+        atcc = np.diff(np.concatenate([[0], yc])) * self.bcore
+
+        # Assign to confined/unconfined
+        conclay = np.zeros((len(yl), 2))
+        k = 0
+        for i in range(len(yl)):
+            if yl[i] <= self.dcore or yl[i] > height - self.dcore:
+                conclay[i, :] = [atc[i], 0]
+            else:
+                conclay[i, :] = [atc[i] - atcc[k], atcc[k]]
+                k += 1
+
+        # Centroids
+        centroids = np.concatenate([[yl[0]/2], 0.5*(yl[:-1] + yl[1:])])
+
+        self.concreteLayers = np.column_stack([
+            centroids, conclay[:, 0], conclay[:, 1], yl, np.zeros(len(yl))
+        ])
+
+    def _setupRebars(self):
+        """Setup longitudinal reinforcement."""
+        geom = self.geometryProps
+        layers = geom['reinforcementLayers']
+
+        # Build arrays of bar positions and areas
+        distld = []
+        areas = []
+        diameters = []
+
+        for layer in layers:
+            dist, nBars, diam = layer
+            for _ in range(int(nBars)):
+                distld.append(dist)
+                areas.append(0.25 * np.pi * (diam**2))
+                diameters.append(diam)
+
+        self.rebarDist = np.array(sorted(distld))
+        self.rebarAreas = np.array([areas[i] for i in np.argsort(distld)])
+        self.rebarDiams = np.array([diameters[i] for i in np.argsort(distld)])
+
+        # Assign to layers and correct concrete areas
+        for k in range(1, len(self.concreteLayers) - 1):
+            rebarInLayer = ((self.rebarDist <= self.concreteLayers[k, 3]) &
+                           (self.rebarDist > self.concreteLayers[k-1, 3]))
+            self.concreteLayers[k, 4] = np.sum(self.rebarAreas[rebarInLayer])
+
+            if self.concreteLayers[k, 2] == 0:
+                self.concreteLayers[k, 1] -= self.concreteLayers[k, 4]
+                if self.concreteLayers[k, 1] < 0:
+                    raise ValueError("Negative concrete area")
+            else:
+                self.concreteLayers[k, 2] -= self.concreteLayers[k, 4]
+                if self.concreteLayers[k, 2] < 0:
+                    raise ValueError("Negative concrete area")
+
+    def _computeMomentCurvature(self, axialLoad):
+        """Compute M-φ for rectangular section (same algorithm as circular)."""
+        geom = self.geometryProps
+        mat = self.materialProps
+        height = geom['height']
+        P = axialLoad * 1000
+
+        deformation = self._createDeformationVector(self.ecu)
+
+        # Adjust for compression
+        if P > 0:
+            newDef = []
+            for defVal in deformation:
+                stressUnconf = self._interpolateStress(
+                    defVal * np.ones(len(self.concreteLayers)),
+                    self.strainUnconf, self.stressUnconf)
+                stressConf = self._interpolateStress(
+                    defVal * np.ones(len(self.concreteLayers)),
+                    self.strainConf, self.stressConf)
+                stressSteel = self._interpolateStress(
+                    defVal * np.ones(len(self.rebarDist)),
+                    self.strainSteel, self.stressSteel)
+
+                compCheck = (np.sum(stressUnconf * self.concreteLayers[:, 1]) +
+                            np.sum(stressConf * self.concreteLayers[:, 2]) +
+                            np.sum(self.rebarAreas * stressSteel))
+
+                if compCheck >= P:
+                    newDef.append(defVal)
+            deformation = np.array(newDef)
+
+        np_points = len(deformation)
+        curvature = np.zeros(np_points + 1)
+        moment = np.zeros(np_points + 1)
+        neutralAxis = np.zeros(np_points + 1)
+        forceError = np.zeros(np_points + 1)
+        numIter = np.zeros(np_points + 1, dtype=int)
+        coverStrain = np.zeros(np_points + 1)
+        coreStrain = np.zeros(np_points + 1)
+        steelStrain = np.zeros(np_points + 1)
+
+        tol = self.analysisParams['tolerance'] * height * geom['width'] * mat['fpc']
+        iterMax = self.analysisParams['iterMax']
+        x = height / 2
+        message = 0
+
+        for k in range(np_points):
+            lostMomControl = np.max(moment[:k+1])
+            if k > 0 and moment[k] < 0.8 * lostMomControl:
+                message = 4
+                break
+
+            F = 10 * tol
+            niter = 0
+
+            while abs(F) > tol:
+                niter += 1
+
+                if x <= height:
+                    strainConcrete = (deformation[k] / x) * (
+                        self.concreteLayers[:, 0] - (height - x))
+                    strainRebar = (deformation[k] / x) * (
+                        self.rebarDist - (height - x))
+                else:
+                    strainConcrete = (deformation[k] / x) * (
+                        x - height + self.concreteLayers[:, 0])
+                    strainRebar = (deformation[k] / x) * (
+                        x - height + self.rebarDist)
+
+                stressUnconf = self._interpolateStress(strainConcrete,
+                                                       self.strainUnconf, self.stressUnconf)
+                stressConf = self._interpolateStress(strainConcrete,
+                                                     self.strainConf, self.stressConf)
+                stressRebar = self._interpolateStress(strainRebar,
+                                                      self.strainSteel, self.stressSteel)
+
+                forceUnconf = stressUnconf * self.concreteLayers[:, 1]
+                forceConf = stressConf * self.concreteLayers[:, 2]
+                forceSteel = self.rebarAreas * stressRebar
+
+                F = np.sum(forceUnconf) + np.sum(forceConf) + np.sum(forceSteel) - P
+
+                if F > 0:
+                    x = x - 0.05 * x
+                else:
+                    x = x + 0.05 * x
+
+                if niter > iterMax:
+                    message = 3
+                    break
+
+            if message == 3:
+                break
+
+            cores = (deformation[k] / x) * abs(x - self.dcore)
+            sameModel = (mat['concreteModel'] == 'mu')
+
+            if not sameModel:
+                if cores >= self.ecu:
+                    message = 1
+                    break
+            else:
+                if deformation[k] >= self.ecu:
+                    message = 1
+                    break
+
+            if abs(strainRebar[0]) > self.esu:
+                message = 2
+                break
+
+            neutralAxis[k+1] = x
+            forceError[k+1] = F
+            numIter[k+1] = niter
+
+            momentVal = (np.sum(forceUnconf * self.concreteLayers[:, 0]) +
+                        np.sum(forceConf * self.concreteLayers[:, 0]) +
+                        np.sum(forceSteel * self.rebarDist) -
+                        P * (height / 2)) / 1e6
+
+            if momentVal < 0:
+                momentVal = -0.01 * momentVal
+
+            moment[k+1] = momentVal
+            curvature[k+1] = 1000 * deformation[k] / x
+            coverStrain[k+1] = deformation[k]
+            coreStrain[k+1] = cores
+            steelStrain[k+1] = strainRebar[0]
+
+            if message != 0:
+                break
+
+        lastIdx = k + 2 if message != 0 else np_points + 1
+
+        return {
+            'curvature': curvature[:lastIdx],
+            'moment': moment[:lastIdx],
+            'neutralAxis': neutralAxis[:lastIdx],
+            'coverStrain': coverStrain[:lastIdx],
+            'coreStrain': coreStrain[:lastIdx],
+            'steelStrain': steelStrain[:lastIdx],
+            'forceError': forceError[:lastIdx],
+            'numIterations': numIter[:lastIdx],
+            'message': message
+        }
+
+    # Use same analyze() workflow as CircularSection
+    def analyze(self, axialLoad=0, performInteraction=False):
+        """Perform complete analysis (same as CircularSection)."""
+        if not hasattr(self, 'memberProps'):
+            raise ValueError("Member properties not set")
+        if not hasattr(self, 'limitStates'):
+            self.setLimitStates()
+
+        print("Setting up fiber section...")
+        self._setupConcreteLayers()
+        self._setupRebars()
+
+        print(f"Computing moment-curvature for P = {axialLoad} kN...")
+        mcResults = self._computeMomentCurvature(axialLoad)
+        self.results['momentCurvature'] = mcResults
+
+        print("Computing section properties...")
+        self._computeSectionProperties(mcResults, axialLoad)
+
+        print("Computing member force-displacement...")
+        self._computeForceDisplacement(mcResults, axialLoad)
+
+        print("Evaluating buckling models...")
+        self._computeBucklingModels()
+
+        print("Evaluating limit states...")
+        self._computeLimitStates()
+
+        if performInteraction:
+            print("Computing P-M interaction diagram...")
+            self._computeInteractionDiagram()
+
+        print("Analysis complete!")
+        return self.results
+
+    # Reuse methods from CircularSection (they work for both)
+    _computeSectionProperties = CircularSection._computeSectionProperties
+    _computeForceDisplacement = CircularSection._computeForceDisplacement
+    _computeShearDisplacement = CircularSection._computeShearDisplacement
+    _computeShearCapacity = CircularSection._computeShearCapacity
+    _computeBucklingModels = CircularSection._computeBucklingModels
+    _computeLimitStates = CircularSection._computeLimitStates
+    _computeInteractionDiagram = CircularSection._computeInteractionDiagram
+    plotResults = CircularSection.plotResults
+    writeResults = CircularSection.writeResults
 
 
 # =============================================================================
